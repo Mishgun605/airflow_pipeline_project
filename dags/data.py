@@ -6,6 +6,8 @@ from airflow_clickhouse_plugin.operators.clickhouse_operator import ClickHouseOp
 from datetime import datetime, timedelta
 import os
 import pandas as pd
+from config import clickhouse_connection
+from config import data_dir 
 # Интерфейс Pandas для HTTP API Clickhouse
 from pandahouse import *
 
@@ -18,71 +20,59 @@ default_args = {
     "retry_delay": timedelta(minutes=2),
 }
 
-clickhouse_connection = {'host': 'http://localhost:8123',
-                         'database': 'bicycle_trips',
-                         'user': 'default',
-                         'password': None}
+# Подготовка данных для анализа 
+def prepare_df(filepath):
+    if filepath.endswith('.csv'):
+        df = pd.read_csv(filepath, sep=',')
+        df['date'] = df['starttime'].apply(
+            lambda x: datetime.strptime(x, '%Y-%m-%d %H:%M:%S'))  # создаем колонку date и превращаем её в объект datetime
+        df['date'] = df['date'].dt.date  # форматируем колонку в тип date
+              
+    return df
 
 
 # Количество поездок в день
 def number_of_trips():
-    data = os.listdir(
-        '/opt/airflow/data_folder')
-    for file in data:
+    for file in data_dir:
         try:
-            df = pd.read_csv(file, sep=',')
+            df = prepare_df(file)
+            # считаем строки и записываем в таблицу clickhouse
+            df = df.value_counts('date').to_frame(name='count')
+            to_clickhouse(df, table='trips_count',
+                        connection=clickhouse_connection)
         except:
             continue
-
-        df['date'] = df['starttime'].apply(
-            lambda x: datetime.strptime(x, '%Y-%m-%d %H:%M:%S'))  # создаем колонку date и превращаем её в объект datetime
-        df['date'] = df['date'].dt.date  # форматируем колонку в тип date
-        # считаем строки и записываем в таблицу clickhouse
-        df = df.value_counts('date').to_frame(name='count')
-        to_clickhouse(df, table='trips_count',
-                      connection=clickhouse_connection)
 
 
 #  Средняя продолжительность поездок в день
 def avg_trip_duration():
-    data = os.listdir(
-        '/opt/airflow/data_folder')
-    for file in data:
+    for file in data_dir:
         try:
-            df = pd.read_csv(file)
+            df = prepare_df(file)
+
+            df_count_sum_trips = df.groupby('date')['tripduration'].agg(
+                count_trips='count', sum_trip_seconds='sum')  # группируем по дате, аггрегируем количество и сумму поездок
+            df_count_sum_trips['avg_duration'] = df_count_sum_trips['sum_trip_seconds'] / \
+                df_count_sum_trips['count_trips']  # создаем колонку средней продолжительности поездки.
+            df_date_avg = df_count_sum_trips[['avg_duration']].round(
+                decimals=2)  # округляем и записываем таблицу clickhouse
+            to_clickhouse(df_date_avg, table='average_trips_duration',
+                            connection=clickhouse_connection)
         except:
             continue
-
-        df['starttime'] = df['starttime'].apply(
-            lambda x: datetime.strptime(x, '%Y-%m-%d %H:%M:%S'))
-        df['date'] = df['starttime'].dt.date
-        df_count_sum_trips = df.groupby('date')['tripduration'].agg(
-            count_trips='count', sum_trip_seconds='sum')  # группируем по дате, аггрегируем количество и сумму поездок
-        df_count_sum_trips['avg_duration'] = df_count_sum_trips['sum_trip_seconds'] / \
-            df_count_sum_trips['count_trips']  # создаем колонку средней продолжительности поездки.
-        df_date_avg = df_count_sum_trips[['avg_duration']].round(
-            decimals=2)  # округляем и записываем таблицу clickhouse
-        to_clickhouse(df_date_avg, table='average_trips_duration',
-                      connection=clickhouse_connection)
 
 
 # Распределение поездок пользователей, разбитых по категории «gender»
 def gender_count():
-    data = os.listdir(
-        '/opt/airflow/data_folder')
-    for file in data:
+    for file in data_dir:
         try:
-            df = pd.read_csv(file)
+            df = prepare_df(file)
+            df_gender_count = df.groupby(['date', 'gender'])[
+                'tripduration'].agg(count='count')  # группируем по стобцам date, gender и аггрегируем количество поездок
+            to_clickhouse(df_gender_count, table='gender_count',
+                            connection=clickhouse_connection)
         except:
-            continue
-
-        df['starttime'] = df['starttime'].apply(
-            lambda x: datetime.strptime(x, '%Y-%m-%d %H:%M:%S'))
-        df['date'] = df['starttime'].dt.date
-        df_gender_count = df.groupby(['date', 'gender'])[
-            'tripduration'].agg(count='count')  # группируем по стобцам date, gender и аггрегируем количество поездок
-        to_clickhouse(df_gender_count, table='gender_count',
-                      connection=clickhouse_connection)
+            continue 
 
 
 #  Забираем данные из таблиц clickhouse и формируем отчеты 
@@ -90,7 +80,7 @@ def statistics_sending():
     trips_count_df = read_clickhouse(
         'SELECT * FROM bicycle_trips.trips_count', connection=clickhouse_connection)
     average_trip_duration_df = read_clickhouse(
-        'SELECT * FROM bicycle_trips.average_trip_duratrion', connection=clickhouse_connection)
+        'SELECT * FROM bicycle_trips.average_trips_duration', connection=clickhouse_connection)
     gender_count_df = read_clickhouse(
         'SELECT * FROM bicycle_trips.gender_count', connection=clickhouse_connection)
 
